@@ -1,0 +1,306 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>streamlab</title>
+<style>
+  :root {
+    --bg: #101216; --panel: #171a20; --line: #262b34; --text: #e6e9ef; --dim: #8b93a1;
+    --good: #3ddc97; --warn: #f5c451; --bad: #ff6b6b; --accent: #6aa9ff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-size: 13px; }
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+           padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { font-size: 14px; margin: 0 12px 0 0; letter-spacing: .5px; color: var(--accent); }
+  button { font: inherit; padding: 7px 14px; border-radius: 6px; cursor: pointer;
+           background: #222733; color: var(--text); border: 1px solid var(--line); }
+  button:hover { border-color: var(--accent); }
+  button[aria-pressed="true"] { background: var(--accent); color: #0b0d11; border-color: var(--accent); font-weight: 600; }
+  #err { color: var(--bad); margin-left: auto; }
+  /* minmax(0,…) so the timeline's long rows scroll inside their panel instead of stretching the
+     grid past the window — the whole point is sitting this next to the emulator. */
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 16px; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+              color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+  #now { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 10px; margin-bottom: 12px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .tile .k { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .tile .v { font-size: 22px; margin-top: 4px; }
+  canvas { width: 100%; height: 180px; display: block; }
+  #feed { max-height: 46vh; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 2px 6px 2px 0; white-space: nowrap; }
+  tr.event td { color: var(--warn); }
+  tr.profile td { color: var(--accent); }
+  tr.bad td { color: var(--bad); }
+  tr.reconnect td { color: var(--bad); }
+  tr.pub-row td { color: #a78bfa; }
+  .pub { color: #a78bfa; font-weight: 600; }
+  .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .dim { color: var(--dim); }
+  #summary td, #recordings td { border-top: 1px solid var(--line); }
+  #summary tr:first-child td, #recordings tr:first-child td { border-top: 0; color: var(--dim); }
+  #rec[aria-pressed="true"] { background: var(--bad); border-color: var(--bad); color: #fff; }
+  #handle-panel { border-color: var(--good); }
+  #handle { font-size: 20px; color: var(--good); user-select: all; cursor: pointer; word-break: break-all; }
+
+  /* The point of this page is sitting beside the emulator, so it has to survive a narrow window. */
+  @media (max-width: 1000px) {
+    main { grid-template-columns: minmax(0, 1fr); }
+    #hint { display: none; }
+  }
+  @media (max-width: 620px) {
+    body { font-size: 12px; }
+    main { padding: 10px; gap: 10px; }
+    header { padding: 8px 10px; gap: 6px; }
+    button { padding: 6px 10px; }
+    canvas { height: 130px; }
+    .tile .v { font-size: 18px; }
+    #feed { max-height: 34vh; }
+  }
+</style>
+
+<header>
+  <h1>streamlab</h1>
+  <button data-p="off" aria-pressed="true">off</button>
+  <button data-p="edge">edge</button>
+  <button data-p="3g">3g</button>
+  <button data-p="lte">lte</button>
+  <button data-p="5g">5g</button>
+  <button data-p="lossy">lossy</button>
+  <button id="rec">⏺ record</button>
+  <span class="dim" id="hint">edge = narrow pipe · lte = the main layer barely fits · 5g = baseline · lossy = wide pipe, loss only</span>
+  <span id="err"></span>
+</header>
+
+<main>
+  <div>
+    <div id="now">
+      <div class="tile"><div class="k">layer</div><div class="v" id="t-layer">–</div></div>
+      <div class="tile"><div class="k">fps</div><div class="v" id="t-fps">–</div></div>
+      <div class="tile"><div class="k">loss</div><div class="v" id="t-loss">–</div></div>
+    </div>
+    <div class="panel"><h2>fps (green) · kbps (blue) · loss (red)</h2><canvas id="chart"></canvas></div>
+    <div class="panel" style="margin-top:16px"><h2>timeline</h2><div id="feed"><table></table></div></div>
+  </div>
+  <div>
+    <div class="panel" id="handle-panel" hidden>
+      <h2>recording handle</h2>
+      <div id="handle"></div>
+      <div class="dim" id="handle-meta"></div>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <h2>summary per room / surface / profile / layer</h2>
+      <table id="summary"></table>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <h2>recordings</h2>
+      <table id="recordings"></table>
+    </div>
+  </div>
+</main>
+
+<script>
+// Events carry the whole logcat stamp so two readers can be ordered against each other;
+// the timeline only needs the time of day.
+const clock = at => String(at).split(' ').pop().split('.')[0];
+
+const samples = [];
+const buttons = [...document.querySelectorAll('button[data-p]')];
+const feed = document.querySelector('#feed table');
+const err = document.getElementById('err');
+
+buttons.forEach(b => b.onclick = async () => {
+  err.textContent = '';
+  const res = await fetch('/profile/' + b.dataset.p, {method: 'POST'}).then(r => r.json());
+  if (!res.ok) { err.textContent = res.error; return; }
+  buttons.forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+});
+
+// Red is reserved for what actually ruins playback: no decoded frames, heavy loss, or freezing.
+function grade(s) {
+  if (s.fps < 10 || s.loss >= 20 || s.frozen >= 10) return 'bad';
+  if (s.loss >= 5 || s.e2e > 1000) return 'warn';
+  return 'good';
+}
+
+// Newest first, but placed by timestamp rather than by arrival: the two readers are separate
+// threads, so the order they reach the browser is not the order the events happened in. Both
+// devices' stamps are already on the host clock by the time they get here, so they compare.
+let current = null;
+
+function row(cells, cls) {
+  const tr = document.createElement('tr');
+  if (cls) tr.className = cls;
+  tr.dataset.at = current ? current.at : '';
+  tr.dataset.seq = current ? current.seq : 0;
+  tr.innerHTML = cells.map(c => `<td>${c}</td>`).join('');
+  const after = [...feed.rows].find(r =>
+    r.dataset.at < tr.dataset.at ||
+    (r.dataset.at === tr.dataset.at && Number(r.dataset.seq) < Number(tr.dataset.seq)));
+  feed.insertBefore(tr, after || null);
+  while (feed.rows.length > 300) feed.deleteRow(-1);
+}
+
+function render(e) {
+  current = e;
+  if (e.kind === 'sample') {
+    samples.push(e);
+    if (samples.length > 400) samples.shift();
+    const g = grade(e);
+    document.getElementById('t-layer').textContent = e.layer;
+    document.getElementById('t-layer').className = 'v ' + g;
+    document.getElementById('t-fps').textContent = e.fps;
+    document.getElementById('t-loss').textContent = e.loss + '%';
+    row([
+      `<span class="dim">${clock(e.at)}</span>`,
+      `<span class="dim">[${e.profile}]</span>`,
+      `<span class="${g}">${e.layer}</span>`,
+      `${e.w}x${e.h}`, `${e.fps} fps`, `${e.kbps} kbps`,
+      `<span class="${e.loss >= 5 ? 'bad' : ''}">loss ${e.loss}%</span>`,
+      `e2e ${e.e2e} ms`, `frozen ${e.frozen}%`,
+      // The app's own verdict beside the numbers it was formed from: a "healthy" next to a dead
+      // stream is exactly the kind of bug this bench exists to catch, and it is only visible when both
+      // are on the same row.
+      e.weak ? `<span class="bad">weak/${(e.link || 'none').toLowerCase()}</span>` : '<span class="dim">ok</span>',
+    ]);
+    draw(); summarise();
+  } else if (e.kind === 'host') {
+    row([`<span class="dim">${clock(e.at)}</span>`, `host → ${e.event.replace('onRemote', '')}`,
+      `<span class="dim">${e.detail || ''}</span>`], 'bad');
+  } else if (e.kind === 'video_state') {
+    row([`<span class="dim">${clock(e.at)}</span>`, `remote video → ${e.state}`,
+      `<span class="dim">reason=${e.reason}</span>`], 'bad');
+  } else if (e.kind === 'profile') {
+    row([`<span class="dim">${clock(e.at)}</span>`, `network → ${e.name}`], 'profile');
+    buttons.forEach(x => x.setAttribute('aria-pressed', String(x.dataset.p === e.name)));
+  } else if (e.kind === 'pub') {
+    // The publisher's own line, marked so the two sides never get mistaken for each other.
+    const backingOff = e.adapt === 'DOWN' || e.link === 'POOR' || e.link === 'BAD'
+      || e.link === 'VERY_BAD' || e.link === 'DOWN' || e.txloss >= 5;
+    row([`<span class="dim">${clock(e.at)}</span>`, `<span class="dim">[${e.profile}]</span>`,
+         `<span class="pub">PUB</span>`, `${e.w}x${e.h}`, `${e.fps} fps`,
+         `enc ${e.enc}k`, `sent ${e.sent}k`, `target ${e.target}k`,
+         `<span class="${backingOff ? 'bad' : 'dim'}">${e.adapt.toLowerCase()} · ${e.link.toLowerCase()} · txloss ${e.txloss}%</span>`,
+         e.dual ? '<span class="dim">dual</span>' : '<span class="bad">no dual</span>'], 'pub-row');
+  } else if (e.kind === 'pub_link') {
+    // Noise on its own; the publisher row above already carries the quality it resolved to.
+  } else if (e.kind === 'reconnect') {
+    row([`<span class="dim">${clock(e.at)}</span>`, `<span class="dim">[${e.profile}]</span>`, 'reconnecting'], 'reconnect');
+  } else if (e.kind === 'note') {
+    row([`<span class="dim">${clock(e.at)}</span>`, e.text], 'event');
+  }
+}
+
+const canvas = document.getElementById('chart');
+function draw() {
+  const dpr = devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr); ctx.clearRect(0, 0, w, h);
+  const data = samples.slice(-120);
+  if (!data.length) return;
+  const maxKbps = Math.max(100, ...data.map(s => s.kbps));
+  const step = w / Math.max(1, data.length - 1);
+  const line = (pick, colour) => {
+    ctx.beginPath(); ctx.strokeStyle = colour; ctx.lineWidth = 1.5;
+    data.forEach((s, i) => {
+      const y = h - 6 - pick(s) * (h - 12);
+      i ? ctx.lineTo(i * step, y) : ctx.moveTo(i * step, y);
+    });
+    ctx.stroke();
+  };
+  // Profile changes are what the eye needs to line the curves up against.
+  data.forEach((s, i) => {
+    if (i && s.profile !== data[i - 1].profile) {
+      ctx.strokeStyle = '#6aa9ff'; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(i * step, 0); ctx.lineTo(i * step, h); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  });
+  line(s => Math.min(1, s.fps / 30), '#3ddc97');
+  line(s => s.kbps / maxKbps, '#6aa9ff');
+  line(s => Math.min(1, s.loss / 100), '#ff6b6b');
+}
+
+// Rows the server computed from the closed recording. While they are set the table shows the
+// run, not the rolling page buffer — those differ, because the buffer starts when the page loads
+// and holds only the last 400 samples.
+let recordedSummary = null;
+
+function summaryTable(rows) {
+  document.getElementById('summary').innerHTML =
+    '<tr><td>room / surface / profile / layer</td><td>n</td><td>fps</td><td>kbps</td><td>loss</td></tr>' +
+    rows.join('');
+}
+
+function summarise() {
+  if (recordedSummary) {
+    const label = r => `${String(r.room).slice(0, 8)} / ${r.surface} / ${r.profile} / ${r.layer}`;
+    summaryTable(recordedSummary.map(r =>
+      `<tr><td>${label(r)}</td><td class="dim">${r.samples}</td><td>${r.fps.toFixed(0)} fps</td>` +
+      `<td>${r.kbps.toFixed(0)}k</td><td class="${r.loss >= 5 ? 'bad' : ''}">${r.loss.toFixed(0)}%</td></tr>`));
+    return;
+  }
+  const groups = {};
+  for (const s of samples) {
+    const key = (s.room || '?') + ' / ' + (s.surface || '?') + ' / ' + s.profile + ' / ' + s.layer;
+    (groups[key] ||= []).push(s);
+  }
+  const avg = (rows, k) => (rows.reduce((a, r) => a + r[k], 0) / rows.length);
+  // The id groups; only the label is shortened, so two rooms sharing a prefix stay apart.
+  const label = key => key.replace(/^[^ ]+/, m => m.slice(0, 8));
+  const rows = Object.entries(groups).sort().map(([key, rs]) =>
+    `<tr><td>${label(key)}</td><td class="dim">${rs.length}</td><td>${avg(rs, 'fps').toFixed(0)} fps</td>` +
+    `<td>${avg(rs, 'kbps').toFixed(0)}k</td><td class="${avg(rs, 'loss') >= 5 ? 'bad' : ''}">${avg(rs, 'loss').toFixed(0)}%</td></tr>`);
+  summaryTable(rows);
+}
+
+const recBtn = document.getElementById('rec');
+const handlePanel = document.getElementById('handle-panel');
+
+recBtn.onclick = async () => {
+  err.textContent = '';
+  const recording = recBtn.getAttribute('aria-pressed') === 'true';
+  const res = await fetch(recording ? '/rec/stop' : '/rec/start', {method: 'POST'}).then(r => r.json());
+  if (!res.ok) { err.textContent = res.error; return; }
+  if (recording) {
+    recBtn.setAttribute('aria-pressed', 'false');
+    recBtn.textContent = '⏺ record';
+    document.getElementById('handle').textContent = res.id;
+    document.getElementById('handle-meta').textContent =
+      `${res.samples} samples over ${res.seconds}s — click the id to select it`;
+    handlePanel.hidden = false;
+    recordedSummary = res.summary || null;
+    summarise();
+  } else {
+    recordedSummary = null;
+    recBtn.setAttribute('aria-pressed', 'true');
+    recBtn.textContent = '⏹ stop  ' + res.id;
+    handlePanel.hidden = true;
+  }
+  loadRecordings();
+};
+
+document.getElementById('handle').onclick = () => {
+  getSelection().selectAllChildren(document.getElementById('handle'));
+  navigator.clipboard?.writeText(document.getElementById('handle').textContent);
+};
+
+async function loadRecordings() {
+  const data = await fetch('/recordings').then(r => r.json());
+  if (data.recording) {
+    recBtn.setAttribute('aria-pressed', 'true');
+    recBtn.textContent = '⏹ stop  ' + data.recording;
+  }
+  document.getElementById('recordings').innerHTML =
+    '<tr><td>id</td><td>size</td></tr>' +
+    data.items.map(r => `<tr><td>${r.id}</td><td class="dim">${r.kb} kB</td></tr>`).join('');
+}
+loadRecordings();
+
+new EventSource('/events').onmessage = m => render(JSON.parse(m.data));
+addEventListener('resize', draw);
+</script>
