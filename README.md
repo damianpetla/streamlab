@@ -1,5 +1,7 @@
 # streamlab
 
+> The story behind this tool: [Build the Instrument First: Testing Adaptive Bitrate for Live Video on Android](https://medium.com/@DamianPetla/build-the-instrument-first-testing-adaptive-bitrate-for-live-video-on-android-197f99759f6d)
+
 A small macOS test bench for live video under bad network conditions. It shapes the network
 the Android emulator uses, reads one stats line per sample from the app's logcat (viewer and,
 optionally, publisher), and puts everything on one timeline in the browser, so a quality change
